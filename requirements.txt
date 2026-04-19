@@ -1,0 +1,4 @@
+# Libraries for My Notes Assistant
+chromadb
+sentence-transformers
+google-generativeai

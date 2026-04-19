@@ -1,0 +1,5 @@
+chroma_db/
+.vscode/
+__pycache__/
+*.pyc
+.env
