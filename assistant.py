@@ -1,164 +1,202 @@
 # assistant.py
 
 import os
-# os lets us read files and folders on your computer
+import time
+import threading
+# threading lets us run the file watcher
+# AND the chat loop at the same time!
+# without it, one would block the other
 
 import chromadb
-# our vector database — stores and searches embeddings
-
 from groq import Groq
-# Groq library — free, super fast AI!
-
 from sentence_transformers import SentenceTransformer
-# converts text to embeddings (numbers)
-# runs locally on your laptop, totally free!
+from watchdog.observers import Observer
+# Observer watches the folder for changes
+
+from watchdog.events import FileSystemEventHandler
+# FileSystemEventHandler defines WHAT to do
+# when a change is detected
 
 
 # ─────────────────────────────────────────────────
-# PART 1: SETUP — keys, models, database
+# PART 1: SETUP
 # ─────────────────────────────────────────────────
 
-# Your free Groq API key
-# paste your key from console.groq.com here
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+NOTES_FOLDER = "./notes"
 
-# Connect to Groq
 groq_client = Groq(api_key=GROQ_API_KEY)
-# this is like logging in to Groq
-
-# Load the embedding model
-# runs on YOUR laptop — no API needed!
-# downloads once (~90MB), saved locally after that
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-# all-MiniLM-L6-v2 = small, fast, accurate
-# perfect for personal notes!
 
-# Setup ChromaDB
-# PersistentClient means it SAVES to disk
-# so next time you run, notes already loaded! ✅
 db = chromadb.PersistentClient(path="./chroma_db")
-
-# get_or_create_collection means:
-# if "my_notes" exists → use it
-# if not → create fresh one
 collection = db.get_or_create_collection("my_notes")
 
 
 # ─────────────────────────────────────────────────
-# PART 2: LOAD NOTES INTO VECTOR DB
+# PART 2: EMBED AND STORE A SINGLE FILE
 # ─────────────────────────────────────────────────
 
-def load_notes():
-    notes_folder = "./notes"
-    # folder where your .txt files live
+def embed_file(filepath):
+    # get just the filename from full path
+    # example: "./notes/work.txt" → "work.txt"
+    filename = os.path.basename(filepath)
 
-    total_chunks = 0
-    # counter to track how many chunks stored
+    # only process .txt files
+    if not filename.endswith(".txt"):
+        return
 
-    # loop through every file in notes/ folder
-    for filename in os.listdir(notes_folder):
+    # open and read the file
+    with open(filepath, "r", encoding="utf-8") as f:
+        text = f.read()
 
-        # skip anything that isnt a .txt file
-        if not filename.endswith(".txt"):
-            continue
+    # split into non-empty lines
+    chunks = [
+        line.strip()
+        for line in text.split("\n")
+        if line.strip()
+    ]
 
-        # build full path to file
-        # example: "./notes/work.txt"
-        filepath = os.path.join(notes_folder, filename)
+    added = 0
+    updated = 0
 
-        # open and read the file
-        with open(filepath, "r", encoding="utf-8") as f:
-            text = f.read()
-        # encoding="utf-8" handles special characters!
+    for i, chunk in enumerate(chunks):
+        chunk_id = f"{filename}_{i}"
 
-        # split into lines — each line = one chunk
-        chunks = [
-            line.strip()                  # remove extra spaces
-            for line in text.split("\n")  # split by newline
-            if line.strip()               # skip empty lines
-        ]
+        # convert chunk to embedding
+        embedding = embedder.encode(chunk).tolist()
 
-        # store each chunk in vector db
-        for i, chunk in enumerate(chunks):
+        # check if this chunk ID already exists
+        existing = collection.get(ids=[chunk_id])
 
-            # unique id for each chunk
-            # example: "work.txt_0", "ideas.txt_2"
-            chunk_id = f"{filename}_{i}"
+        if existing["ids"]:
+            # chunk exists — check if text changed
+            existing_text = existing["documents"][0]
 
-            # check if chunk already exists in db
-            # why? PersistentClient remembers between runs!
-            # without this check, duplicates get stored
-            existing = collection.get(ids=[chunk_id])
-            if existing["ids"]:
+            if existing_text == chunk:
+                # exact same text → skip, no change
                 continue
-            # if already exists → skip it
-
-            # convert chunk text to embedding (numbers)
-            embedding = embedder.encode(chunk).tolist()
-            # .encode()  → text to numpy array
-            # .tolist()  → numpy array to plain python list
-            # chromadb needs plain list, not numpy!
-
-            # store in chromadb
+            else:
+                # text changed! update it
+                # ChromaDB uses .update() to replace
+                collection.update(
+                    ids=[chunk_id],
+                    documents=[chunk],
+                    embeddings=[embedding]
+                )
+                updated += 1
+        else:
+            # brand new chunk → add it
             collection.add(
-                documents=[chunk],      # original text
-                embeddings=[embedding], # the numbers
-                ids=[chunk_id]          # unique name
+                ids=[chunk_id],
+                documents=[chunk],
+                embeddings=[embedding]
             )
+            added += 1
 
-            total_chunks += 1
-
-    print(f"Loaded {total_chunks} new chunks into vector DB!")
+    if added > 0 or updated > 0:
+        print(f"\n[Auto-update] {filename}: "
+              f"{added} new chunks added, "
+              f"{updated} chunks updated")
+        print("You: ", end="", flush=True)
+        # reprint "You: " so chat doesnt look broken
+        # flush=True forces it to print immediately
 
 
 # ─────────────────────────────────────────────────
-# PART 3: SEARCH NOTES
+# PART 3: LOAD ALL NOTES AT STARTUP
+# ─────────────────────────────────────────────────
+
+def load_all_notes():
+    total = 0
+    for filename in os.listdir(NOTES_FOLDER):
+        filepath = os.path.join(NOTES_FOLDER, filename)
+        if filename.endswith(".txt"):
+            embed_file(filepath)
+            total += 1
+    print(f"Loaded {total} files into vector DB!")
+
+
+# ─────────────────────────────────────────────────
+# PART 4: FILE WATCHER
+# ─────────────────────────────────────────────────
+
+class NotesWatcher(FileSystemEventHandler):
+    # This class defines what happens when
+    # watchdog detects a change in the notes/ folder
+
+    def on_modified(self, event):
+        # called when an existing file is edited and saved
+        if not event.is_directory:
+            # event.src_path = full path of changed file
+            print(f"\n[Detected change] {event.src_path}")
+            embed_file(event.src_path)
+
+    def on_created(self, event):
+        # called when a NEW file is added to notes/
+        if not event.is_directory:
+            print(f"\n[New file detected] {event.src_path}")
+            # small delay to make sure file is fully written
+            # before we try to read it
+            time.sleep(0.5)
+            embed_file(event.src_path)
+
+    def on_deleted(self, event):
+        # called when a file is deleted
+        # we just notify — we don't remove from DB
+        # (old notes stay searchable even if file deleted)
+        if not event.is_directory:
+            filename = os.path.basename(event.src_path)
+            print(f"\n[File deleted] {filename} "
+                  f"(existing chunks kept in DB)")
+            print("You: ", end="", flush=True)
+
+
+def start_watcher():
+    # create the watcher and observer
+    event_handler = NotesWatcher()
+    observer = Observer()
+
+    # tell observer to watch notes/ folder
+    # recursive=False means don't watch subfolders
+    observer.schedule(event_handler, NOTES_FOLDER, recursive=False)
+
+    # start watching in background
+    observer.start()
+    print("Watching notes/ folder for changes...")
+
+    return observer
+    # we return observer so we can stop it later on quit
+
+
+# ─────────────────────────────────────────────────
+# PART 5: SEARCH NOTES
 # ─────────────────────────────────────────────────
 
 def search_notes(question):
-    # convert question to embedding (numbers)
     question_embedding = embedder.encode(question).tolist()
-    # same process as chunks — text → numbers
 
-    # search vector db for top 3 closest chunks
     results = collection.query(
         query_embeddings=[question_embedding],
         n_results=3
-        # n_results=3 → give me 3 best matches
-        # more context = better answer!
     )
 
-    # results structure looks like:
-    # {
-    #   "documents": [["chunk1", "chunk2", "chunk3"]],
-    #   "ids":       [["work.txt_0", "ideas.txt_1", ...]]
-    # }
-    # [0] gets results for our first (only) query
-    chunks = results["documents"][0]
-
-    return chunks
-    # returns list of 3 most relevant text chunks
+    return results["documents"][0]
 
 
 # ─────────────────────────────────────────────────
-# PART 4: ASK GROQ (FREE + FAST LLM!)
+# PART 6: ASK GROQ
 # ─────────────────────────────────────────────────
 
 def ask_groq(question, context_chunks):
-    # join 3 chunks into one block of context
     context = "\n".join(context_chunks)
-    # "\n".join puts each chunk on its own line
-    # example output:
-    # "The deadline is 15th June.
-    #  I want to learn ML in 2025.
-    #  Save 2 lakhs by December."
 
-    # build the full prompt
     prompt = f"""
 You are a helpful personal assistant.
 Use ONLY the notes below to answer the question.
 If the answer is not in the notes, say "I don't have notes on that."
 Keep your answer short and clear.
+The notes are written by the user about themselves.
+Always refer to the user as "you" or "your", never use "I" or "my".
 
 Notes:
 {context}
@@ -166,68 +204,58 @@ Notes:
 Question: {question}
 
 Answer:"""
-    # why "use ONLY the notes"?
-    # so Groq doesnt make stuff up from its own training!
-    # we want answers ONLY from our notes
 
-    # call Groq API
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        # LLaMA 3.3 70B — very powerful free model!
-        # runs on Groq's special fast chips
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
+        messages=[{"role": "user", "content": prompt}],
         max_tokens=500
-        # max length of the answer
-        # 500 tokens = roughly 350 words
-        # plenty for notes questions!
     )
 
-    # extract just the answer text
     return response.choices[0].message.content
-    # .choices[0]          → first response (only one)
-    # .message.content     → the actual answer string
 
 
 # ─────────────────────────────────────────────────
-# PART 5: MAIN — run the assistant!
+# PART 7: MAIN
 # ─────────────────────────────────────────────────
 
-# load all notes into vector db first
+# load all existing notes first
 print("Loading your notes...")
-load_notes()
-# reads all .txt files from notes/ folder
-# converts each line to embedding
-# stores in chromadb (skips duplicates!)
+load_all_notes()
+
+# start file watcher in background
+observer = start_watcher()
 
 print("\nNotes assistant ready!")
 print("Ask me anything about your notes.")
+print("Add or edit any .txt file in notes/ — updates instantly!")
 print("Type 'quit' to exit.\n")
 
-# keep looping until user types quit
-while True:
+try:
+    while True:
+        question = input("You: ").strip()
 
-    # wait for user to type something
-    question = input("You: ").strip()
-    # .strip() removes accidental spaces
+        if question.lower() == "quit":
+            print("Stopping file watcher...")
+            observer.stop()
+            # stop the background watcher cleanly
+            observer.join()
+            # wait for it to fully stop
+            print("Bye!")
+            break
 
-    # exit if user types quit
-    if question.lower() == "quit":
-        print("Bye!")
-        break
+        if not question:
+            continue
 
-    # skip if user just pressed enter
-    if not question:
-        continue
+        print("Searching your notes...")
+        relevant_chunks = search_notes(question)
 
-    # STEP 1: find relevant chunks from notes
-    print("Searching your notes...")
-    relevant_chunks = search_notes(question)
+        print("Thinking...\n")
+        answer = ask_groq(question, relevant_chunks)
 
-    # STEP 2: send chunks + question to Groq
-    print("Thinking...\n")
-    answer = ask_groq(question, relevant_chunks)
+        print(f"Assistant: {answer}\n")
 
-    # STEP 3: show the answer!
-    print(f"Assistant: {answer}\n")
+except KeyboardInterrupt:
+    # if user presses Ctrl+C instead of typing quit
+    print("\nStopping...")
+    observer.stop()
+    observer.join()

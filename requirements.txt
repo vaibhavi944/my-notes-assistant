@@ -2,3 +2,4 @@
 chromadb
 sentence-transformers
 google-generativeai
+watchdog
